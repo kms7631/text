@@ -107,6 +107,212 @@ npm start
    - 수정된 줄 번호
    - 수정 내용 요약
 
+## 시스템 아키텍처
+
+### 시퀀스 다이어그램
+
+#### 1. 사용자 접속 및 문서 편집 흐름
+
+```mermaid
+sequenceDiagram
+    participant U as 사용자 (브라우저)
+    participant P as 페이지 컴포넌트
+    participant H as usePresence 훅
+    participant WS as WebSocket 클라이언트
+    participant S as Socket.IO 서버
+    participant DB as SQLite DB
+
+    U->>P: 문서 페이지 접속
+    P->>H: usePresence 초기화
+    H->>WS: Socket.IO 연결
+    WS->>S: WebSocket 연결 요청
+    S-->>WS: 연결 성공
+    WS->>S: join_document 이벤트
+    S->>S: 방(room)에 사용자 추가
+    S->>DB: (선택적) 접속 정보 저장
+    S-->>WS: collaborator_joined 이벤트 (전체 사용자 목록)
+    WS-->>H: 접속자 목록 업데이트
+    H-->>P: collaborators 상태 업데이트
+    P-->>U: 접속자 목록 UI 표시
+    
+    U->>P: 문서 내용 입력
+    P->>H: startEditing() 호출
+    H->>WS: start_editing 이벤트
+    WS->>S: 편집 시작 알림
+    S-->>WS: collaborator_editing 이벤트 (다른 클라이언트)
+    WS-->>H: 편집 상태 업데이트
+    H-->>P: "OOO 님이 편집 중..." 표시
+```
+
+#### 2. 실시간 문서 동기화 흐름
+
+```mermaid
+sequenceDiagram
+    participant U1 as 사용자 A
+    participant E1 as DocumentEditor A
+    participant DS1 as useDocumentSync A
+    participant WS1 as WebSocket A
+    participant S as Socket.IO 서버
+    participant WS2 as WebSocket B
+    participant DS2 as useDocumentSync B
+    participant E2 as DocumentEditor B
+    participant U2 as 사용자 B
+    participant API as Next.js API
+    participant DB as SQLite DB
+
+    U1->>E1: 텍스트 입력
+    E1->>E1: 디바운스 (500ms)
+    E1->>DS1: updateDocument(content)
+    DS1->>WS1: update_document 이벤트
+    WS1->>S: 문서 내용 브로드캐스트
+    S->>WS2: document_updated 이벤트
+    WS2->>DS2: 실시간 업데이트 수신
+    DS2->>E2: onContentUpdate 콜백
+    E2->>U2: 화면에 내용 반영
+    
+    Note over DS1,DB: 동시에 DB에도 저장
+    DS1->>API: PATCH /api/documents/[id]
+    API->>DB: 문서 내용 업데이트
+    DB-->>API: 저장 완료
+    API-->>DS1: 응답
+```
+
+#### 3. 변경 이력 생성 흐름
+
+```mermaid
+sequenceDiagram
+    participant U as 사용자
+    participant E as DocumentEditor
+    participant TL as useTimeline 훅
+    participant WS as WebSocket 클라이언트
+    participant S as Socket.IO 서버
+    participant DB as SQLite DB
+    participant T as Timeline 컴포넌트
+
+    U->>E: "활동 올리기" 버튼 클릭
+    E->>E: 현재 줄 번호 및 내용 추출
+    E->>TL: createEditLog(userName, lineNumber, summary)
+    TL->>WS: create_edit_log 이벤트
+    WS->>S: 편집 로그 생성 요청
+    S->>DB: EditLog 레코드 생성
+    DB-->>S: 생성 완료
+    S->>S: 같은 방의 모든 클라이언트에 브로드캐스트
+    S-->>WS: edit_log_created 이벤트
+    WS->>TL: 실시간 로그 수신
+    TL->>TL: editLogs 상태 업데이트
+    TL-->>T: 타임라인 리스트 갱신
+    T-->>U: 새로운 변경 이력 표시
+```
+
+#### 4. 세션 리플레이 흐름
+
+```mermaid
+sequenceDiagram
+    participant U as 사용자
+    participant SR as SessionReplay 컴포넌트
+    participant R as useSessionReplay 훅
+    participant API as Next.js API
+    participant DB as SQLite DB
+    participant E as DocumentEditor
+
+    U->>SR: "히스토리 재생" 버튼 클릭
+    SR->>R: startReplay() 호출
+    R->>API: GET /api/edit-logs?documentId=xxx
+    API->>DB: EditLog 조회 (시간순 정렬)
+    DB-->>API: EditLog 리스트 반환
+    API-->>R: 편집 로그 데이터
+    R->>R: 내용 히스토리 생성 (각 시점의 문서 내용 추정)
+    R->>R: 자동 재생 시작 (setInterval)
+    
+    loop 각 EditLog마다
+        R->>R: currentIndex 증가
+        R->>R: 해당 시점의 내용으로 replayContent 업데이트
+        R-->>SR: 재생 상태 업데이트
+        SR->>E: readOnly 모드로 리플레이 내용 표시
+        E-->>U: 해당 시점의 문서 내용 표시
+    end
+    
+    U->>SR: 일시정지/다음/이전 버튼 클릭
+    SR->>R: 재생 제어 함수 호출
+    R->>R: 재생 상태 변경
+    R-->>SR: UI 업데이트
+```
+
+#### 5. 유저별 기여도 통계 조회 흐름
+
+```mermaid
+sequenceDiagram
+    participant U as 사용자
+    participant CC as ContributionChart 컴포넌트
+    participant CS as useContributionStats 훅
+    participant API as Next.js API
+    participant DB as SQLite DB
+
+    U->>CC: 문서 페이지 로드
+    CC->>CS: useContributionStats 초기화
+    CS->>API: GET /api/edit-logs/stats?documentId=xxx&period=all
+    API->>DB: EditLog 조회 (기간 필터 적용)
+    DB-->>API: EditLog 리스트 반환
+    API->>API: 사용자별 집계 (groupBy userName)
+    API->>API: 각 사용자의 count 및 ratio 계산
+    API-->>CS: 통계 데이터 반환
+    CS->>CS: stats 상태 업데이트
+    CS-->>CC: 통계 데이터 전달
+    CC->>CC: 막대 그래프 렌더링
+    CC-->>U: 기여도 차트 표시
+    
+    U->>CC: 기간 필터 변경 (전체/오늘/7일)
+    CC->>CS: period 변경
+    CS->>API: 새로운 기간으로 재조회
+    API->>DB: 필터링된 EditLog 조회
+    DB-->>API: 결과 반환
+    API-->>CS: 업데이트된 통계
+    CS-->>CC: 차트 갱신
+    CC-->>U: 새로운 기여도 표시
+```
+
+#### 6. 전체 시스템 아키텍처
+
+```mermaid
+graph TB
+    subgraph "클라이언트 (브라우저)"
+        A[사용자 인터페이스]
+        B[React 컴포넌트]
+        C[커스텀 훅]
+        D[Socket.IO 클라이언트]
+    end
+    
+    subgraph "서버 (Next.js)"
+        E[Next.js App Router]
+        F[API Routes]
+        G[Socket.IO 서버]
+        H[Prisma ORM]
+    end
+    
+    subgraph "데이터베이스"
+        I[(SQLite)]
+    end
+    
+    A --> B
+    B --> C
+    C --> D
+    C --> F
+    D <--> G
+    F --> H
+    G --> H
+    H --> I
+    
+    style A fill:#e1f5ff
+    style B fill:#e1f5ff
+    style C fill:#e1f5ff
+    style D fill:#e1f5ff
+    style E fill:#fff4e1
+    style F fill:#fff4e1
+    style G fill:#fff4e1
+    style H fill:#fff4e1
+    style I fill:#ffe1e1
+```
+
 ## 프로젝트 구조
 
 ```
